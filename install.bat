@@ -48,6 +48,7 @@ echo Creating data folders...
 if not exist uploads mkdir uploads
 if not exist cogs mkdir cogs
 if not exist templates mkdir templates
+if not exist static mkdir static
 
 echo.
 echo Setup complete. Run run.bat to start the portal.

@@ -4,16 +4,20 @@ from uuid import uuid4
 
 import aiofiles
 import base64
+import csv
 import hashlib
 import io
 import json
 import logging
 import numpy as np
+import ezdxf
 from PIL import Image
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
@@ -73,6 +77,7 @@ COG_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="COG Tiler PoC")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
 def raster_path(url: str = Query(..., description="Local COG path or URI")) -> str:
@@ -159,6 +164,37 @@ def infer_category_from_relative_path(relative_path: str) -> str | None:
 
 def write_cog_metadata(cog_path: Path, metadata: dict) -> None:
     metadata_path(cog_path).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def build_cog_destination_profile(category: str) -> dict:
+    if category == "ortho":
+        profile = dict(cog_profiles.get("jpeg"))
+        profile.update(
+            {
+                "compress": "JPEG",
+                "quality": 85,
+                "photometric": "YCbCr",
+                "bigtiff": "IF_SAFER",
+                "num_threads": "ALL_CPUS",
+            }
+        )
+        return profile
+
+    if category in {"dtm", "dsm"}:
+        profile = dict(cog_profiles.get("deflate"))
+        profile.update(
+            {
+                "compress": "LERC_ZSTD",
+                "max_z_error": 0.001,
+                "bigtiff": "IF_SAFER",
+                "num_threads": "ALL_CPUS",
+            }
+        )
+        return profile
+
+    profile = dict(cog_profiles.get("deflate"))
+    profile.update({"bigtiff": "IF_SAFER", "num_threads": "ALL_CPUS"})
+    return profile
 
 
 def calculate_percentile_rescale(cog_path: Path) -> dict[str, float] | None:
@@ -308,13 +344,7 @@ async def upload_and_convert(file: UploadFile = File(...), category: str = Form(
             cog_path.unlink(missing_ok=True)
             metadata_path(cog_path).unlink(missing_ok=True)
 
-        dst_profile = cog_profiles.get("deflate")
-        dst_profile.update(
-            {
-                "BIGTIFF": "IF_SAFER",
-                "NUM_THREADS": "ALL_CPUS",
-            }
-        )
+        dst_profile = build_cog_destination_profile(category)
         conversion_started = perf_counter()
         await run_in_threadpool(
             cog_translate,
@@ -474,6 +504,153 @@ async def cog_bounds(filename: str):
     return {
         "bounds": [west, south, east, north],
     }
+
+
+def get_cog_path_or_404(filename: str) -> Path:
+    cog_path = (COG_DIR / Path(filename).name).resolve()
+
+    if not cog_path.exists() or not cog_path.is_file():
+        raise HTTPException(status_code=404, detail="COG not found.")
+
+    return cog_path
+
+
+def coordinate_range(start: float, stop: float, step: float, descending: bool = False):
+    if step <= 0:
+        raise ValueError("Interval must be greater than 0.")
+
+    value = start
+
+    if descending:
+        while value >= stop:
+            yield value
+            value -= step
+    else:
+        while value <= stop:
+            yield value
+            value += step
+
+
+def extract_sample_value(sample, nodata):
+    value = sample[0]
+
+    if np.ma.is_masked(value):
+        return None
+
+    value = float(value)
+
+    if not np.isfinite(value):
+        return None
+
+    if nodata is not None and np.isclose(value, float(nodata)):
+        return None
+
+    return value
+
+
+def csv_grid_generator(cog_path: Path, interval: float):
+    with rasterio.open(cog_path) as dataset:
+        bounds = dataset.bounds
+        nodata = dataset.nodata
+        batch_size = 5000
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["X", "Y", "Z"])
+        yield output.getvalue()
+
+        for y in coordinate_range(bounds.top, bounds.bottom, interval, descending=True):
+            batch = []
+
+            for x in coordinate_range(bounds.left, bounds.right, interval):
+                batch.append((x, y))
+
+                if len(batch) >= batch_size:
+                    output = io.StringIO()
+                    writer = csv.writer(output)
+
+                    for coord, sample in zip(batch, dataset.sample(batch, masked=True)):
+                        z = extract_sample_value(sample, nodata)
+                        if z is not None:
+                            writer.writerow([coord[0], coord[1], z])
+
+                    yield output.getvalue()
+                    batch = []
+
+            if batch:
+                output = io.StringIO()
+                writer = csv.writer(output)
+
+                for coord, sample in zip(batch, dataset.sample(batch, masked=True)):
+                    z = extract_sample_value(sample, nodata)
+                    if z is not None:
+                        writer.writerow([coord[0], coord[1], z])
+
+                yield output.getvalue()
+
+
+def build_dxf_grid(cog_path: Path, interval: float) -> bytes:
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 6
+    msp = doc.modelspace()
+
+    with rasterio.open(cog_path) as dataset:
+        bounds = dataset.bounds
+        nodata = dataset.nodata
+        batch_size = 5000
+
+        for y in coordinate_range(bounds.top, bounds.bottom, interval, descending=True):
+            batch = []
+
+            for x in coordinate_range(bounds.left, bounds.right, interval):
+                batch.append((x, y))
+
+                if len(batch) >= batch_size:
+                    for coord, sample in zip(batch, dataset.sample(batch, masked=True)):
+                        z = extract_sample_value(sample, nodata)
+                        if z is not None:
+                            msp.add_point((coord[0], coord[1], z))
+
+                    batch = []
+
+            if batch:
+                for coord, sample in zip(batch, dataset.sample(batch, masked=True)):
+                    z = extract_sample_value(sample, nodata)
+                    if z is not None:
+                        msp.add_point((coord[0], coord[1], z))
+
+    output = io.StringIO()
+    doc.write(output)
+    return output.getvalue().encode("utf-8")
+
+
+@app.get("/export-grid")
+async def export_grid(
+    filename: str = Query(...),
+    interval: float = Query(..., gt=0),
+    format: str = Query("csv"),
+):
+    cog_path = get_cog_path_or_404(filename)
+    export_format = format.lower()
+
+    if export_format not in {"csv", "dxf"}:
+        raise HTTPException(status_code=400, detail="Grid export format must be csv or dxf.")
+
+    output_name = f"{cog_path.stem}_grid_{str(interval).replace('.', 'p')}.{export_format}"
+
+    if export_format == "csv":
+        return StreamingResponse(
+            csv_grid_generator(cog_path, interval),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{output_name}"'},
+        )
+
+    dxf_bytes = await run_in_threadpool(build_dxf_grid, cog_path, interval)
+    return StreamingResponse(
+        io.BytesIO(dxf_bytes),
+        media_type="application/dxf",
+        headers={"Content-Disposition": f'attachment; filename="{output_name}"'},
+    )
 
 
 def parse_rescale(value: str | None) -> tuple[float, float] | None:
