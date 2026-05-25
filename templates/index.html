@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>COG Tile Streaming PoC</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    crossorigin=""
+  />
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: #1d232a;
+      background: #f4f7fb;
+      font-family: Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 100vh;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      background: #ffffff;
+      border-bottom: 1px solid #d9e2ec;
+      box-shadow: 0 2px 12px rgba(29, 35, 42, 0.08);
+      z-index: 500;
+    }
+
+    .brand {
+      margin-right: auto;
+      font-size: 18px;
+      font-weight: 700;
+      color: #243447;
+      white-space: nowrap;
+    }
+
+    .file-input {
+      max-width: 340px;
+      padding: 8px;
+      color: #243447;
+      background: #eef3f8;
+      border: 1px solid #c9d6e2;
+      border-radius: 6px;
+    }
+
+    .cog-select {
+      min-width: 280px;
+      max-width: 360px;
+      height: 38px;
+      padding: 0 10px;
+      color: #243447;
+      background: #ffffff;
+      border: 1px solid #c9d6e2;
+      border-radius: 6px;
+    }
+
+    .type-select {
+      min-width: 150px;
+      height: 38px;
+      padding: 0 10px;
+      color: #243447;
+      background: #ffffff;
+      border: 1px solid #c9d6e2;
+      border-radius: 6px;
+    }
+
+    button {
+      min-height: 38px;
+      padding: 0 16px;
+      color: #ffffff;
+      font-weight: 700;
+      cursor: pointer;
+      background: #0b6f6a;
+      border: 0;
+      border-radius: 6px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      background: #8aa3a1;
+    }
+
+    .status {
+      min-width: 180px;
+      color: #44515f;
+      font-size: 14px;
+    }
+
+    .status.error {
+      color: #b42318;
+      font-weight: 700;
+    }
+
+    #map {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .legend {
+      position: absolute;
+      right: 18px;
+      bottom: 26px;
+      display: none;
+      width: 170px;
+      padding: 12px;
+      color: #243447;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid #c9d6e2;
+      border-radius: 6px;
+      box-shadow: 0 4px 18px rgba(29, 35, 42, 0.16);
+      z-index: 700;
+    }
+
+    .legend.visible {
+      display: block;
+    }
+
+    .legend-title {
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .legend-body {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .legend-ramp {
+      min-height: 150px;
+      border: 1px solid #9fb0bf;
+      border-radius: 4px;
+      background: linear-gradient(
+        to top,
+        rgb(30, 50, 200) 0%,
+        rgb(0, 225, 225) 25%,
+        rgb(0, 210, 0) 50%,
+        rgb(230, 230, 0) 75%,
+        rgb(230, 30, 30) 100%
+      );
+    }
+
+    .legend-labels {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+
+    .legend-note {
+      margin-top: 8px;
+      color: #5c6875;
+      font-size: 11px;
+    }
+
+    @media (max-width: 720px) {
+      .brand,
+      .file-input,
+      .type-select,
+      .cog-select,
+      button,
+      .status {
+        width: 100%;
+        max-width: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="toolbar">
+      <div class="brand">COG Tile Streaming PoC</div>
+      <select id="categorySelect" class="type-select" aria-label="Upload type">
+        <option value="ortho">Orthomosaic</option>
+        <option value="dtm">DTM</option>
+        <option value="dsm">DSM</option>
+      </select>
+      <input id="fileInput" class="file-input" type="file" accept=".tif,.tiff" />
+      <button id="convertButton" type="button">Convert to COG &amp; View</button>
+      <input id="folderInput" class="file-input" type="file" webkitdirectory directory multiple />
+      <button id="bulkButton" type="button">Process Folder</button>
+      <select id="cogSelect" class="cog-select" aria-label="Converted COG list">
+        <option value="">Loading converted COGs...</option>
+      </select>
+      <button id="viewCogButton" type="button">View Existing</button>
+      <button id="refreshCogsButton" type="button">Refresh List</button>
+      <div id="status" class="status">Ready</div>
+    </section>
+
+    <div id="map"></div>
+    <aside id="legend" class="legend" aria-label="Elevation color legend">
+      <div id="legendTitle" class="legend-title">DTM Elevation</div>
+      <div class="legend-body">
+        <div class="legend-ramp"></div>
+        <div class="legend-labels">
+          <span id="legendMax">High</span>
+          <span id="legendMid">Mid</span>
+          <span id="legendMin">Low</span>
+        </div>
+      </div>
+      <div class="legend-note">Agisoft elevation ramp</div>
+    </aside>
+  </main>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    crossorigin=""
+  ></script>
+  <script>
+    const fileInput = document.getElementById("fileInput");
+    const folderInput = document.getElementById("folderInput");
+    const categorySelect = document.getElementById("categorySelect");
+    const convertButton = document.getElementById("convertButton");
+    const bulkButton = document.getElementById("bulkButton");
+    const cogSelect = document.getElementById("cogSelect");
+    const viewCogButton = document.getElementById("viewCogButton");
+    const refreshCogsButton = document.getElementById("refreshCogsButton");
+    const statusEl = document.getElementById("status");
+    const legend = document.getElementById("legend");
+    const legendTitle = document.getElementById("legendTitle");
+    const legendMax = document.getElementById("legendMax");
+    const legendMid = document.getElementById("legendMid");
+    const legendMin = document.getElementById("legendMin");
+
+    const map = L.map("map", {
+      preferCanvas: true,
+      worldCopyJump: true,
+    }).setView([20, 0], 2);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    let cogLayer = null;
+    let cogCatalog = new Map();
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.classList.toggle("error", isError);
+    }
+
+    function buildTileUrl(filename, cogMeta = {}) {
+      const encodedFilename = encodeURIComponent(filename);
+      const params = new URLSearchParams();
+      const category = (cogMeta.category || "ortho").toLowerCase();
+      const rescale = cogMeta.rescale;
+
+      if (cogMeta.modified) {
+        params.set("v", cogMeta.modified);
+      }
+
+      if ((category === "dtm" || category === "dsm") && rescale && rescale.min !== undefined && rescale.max !== undefined) {
+        params.set("colormap_name", "agisoft_dem");
+        params.set("rescale", `${rescale.min},${rescale.max}`);
+      }
+
+      const query = params.toString();
+      return `${window.location.origin}/cog-tiles/${encodedFilename}/{z}/{x}/{y}.png${query ? `?${query}` : ""}`;
+    }
+
+    async function fetchCogBounds(filename) {
+      const boundsUrl = `${window.location.origin}/cog-bounds/${encodeURIComponent(filename)}`;
+      const response = await fetch(boundsUrl);
+
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Could not read raster bounds.");
+      }
+
+      return response.json();
+    }
+
+    function getLeafletBounds(boundsResponse) {
+      const bounds = boundsResponse.bounds || boundsResponse;
+
+      if (!Array.isArray(bounds) || bounds.length !== 4) {
+        throw new Error("TiTiler returned an unexpected bounds response.");
+      }
+
+      const [west, south, east, north] = bounds;
+      return [[south, west], [north, east]];
+    }
+
+    function formatElevation(value) {
+      if (value === undefined || value === null || Number.isNaN(Number(value))) {
+        return "-";
+      }
+
+      return `${Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 })} m`;
+    }
+
+    function updateLegend(cogMeta = {}) {
+      const category = (cogMeta.category || "ortho").toLowerCase();
+      const rescale = cogMeta.rescale;
+
+      if ((category !== "dtm" && category !== "dsm") || !rescale) {
+        legend.classList.remove("visible");
+        return;
+      }
+
+      const min = Number(rescale.min);
+      const max = Number(rescale.max);
+      const mid = min + ((max - min) / 2);
+
+      legendTitle.textContent = category === "dsm" ? "DSM Elevation" : "DTM Elevation";
+      legendMax.textContent = formatElevation(max);
+      legendMid.textContent = formatElevation(mid);
+      legendMin.textContent = formatElevation(min);
+      legend.classList.add("visible");
+    }
+
+    async function loadCogList(selectedFilename = "") {
+      const response = await fetch("/cogs");
+
+      if (!response.ok) {
+        cogSelect.innerHTML = `<option value="">Could not load COG list</option>`;
+        return;
+      }
+
+      const result = await response.json();
+      const cogs = result.cogs || [];
+      cogCatalog = new Map(cogs.map((cog) => [cog.filename, cog]));
+
+      cogSelect.innerHTML = "";
+
+      if (!cogs.length) {
+        cogSelect.append(new Option("No converted COGs yet", ""));
+        return;
+      }
+
+      const groups = [
+        ["ortho", "Orthomosaic"],
+        ["dtm", "DTM"],
+        ["dsm", "DSM"],
+      ];
+
+      for (const [category, label] of groups) {
+        const categoryCogs = cogs.filter((cog) => cog.valid && (cog.category || "ortho") === category);
+
+        if (!categoryCogs.length) {
+          continue;
+        }
+
+        const group = document.createElement("optgroup");
+        group.label = label;
+
+        for (const cog of categoryCogs) {
+          const rescaleText = cog.rescale ? ` · ${cog.rescale.min} to ${cog.rescale.max}` : "";
+          const itemLabel = cog.valid
+            ? `${cog.filename} (${cog.size_mb} MB${rescaleText})`
+            : `${cog.filename} - needs reconversion`;
+          const option = new Option(itemLabel, cog.filename);
+          option.disabled = !cog.valid;
+          option.title = cog.valid ? "Ready to view" : (cog.error || "Invalid COG");
+          group.append(option);
+        }
+
+        cogSelect.append(group);
+      }
+
+      const invalidCogs = cogs.filter((cog) => !cog.valid);
+      if (invalidCogs.length) {
+        const group = document.createElement("optgroup");
+        group.label = "Needs reconversion";
+
+        for (const cog of invalidCogs) {
+          const option = new Option(`${cog.filename} - ${cog.error || "invalid"}`, cog.filename);
+          option.disabled = true;
+          group.append(option);
+        }
+
+        cogSelect.append(group);
+      }
+
+      if (!cogSelect.options.length) {
+        cogSelect.append(new Option("No valid converted COGs", ""));
+      }
+
+      if (selectedFilename) {
+        cogSelect.value = selectedFilename;
+      }
+    }
+
+    async function viewCog(filename) {
+      if (!filename) {
+        setStatus("Choose a converted COG from the list.", true);
+        return;
+      }
+
+      setStatus("Loading existing COG...");
+
+      const boundsResponse = await fetchCogBounds(filename);
+      const leafletBounds = getLeafletBounds(boundsResponse);
+      const cogMeta = cogCatalog.get(filename) || {};
+      const tileUrl = buildTileUrl(filename, cogMeta);
+
+      if (cogLayer) {
+        map.removeLayer(cogLayer);
+      }
+
+      cogLayer = L.tileLayer(tileUrl, {
+        tileSize: 256,
+        opacity: (cogMeta.category === "dtm" || cogMeta.category === "dsm") ? 1 : 0.85,
+        bounds: leafletBounds,
+        maxZoom: 22,
+        keepBuffer: 1,
+        updateWhenIdle: true,
+        attribution: "COG via TiTiler",
+      }).addTo(map);
+
+      map.setMaxBounds(L.latLngBounds(leafletBounds).pad(0.5));
+      map.fitBounds(leafletBounds, { padding: [24, 24] });
+      updateLegend(cogMeta);
+      setStatus(`Viewing existing COG: ${filename}`);
+    }
+
+    convertButton.addEventListener("click", async () => {
+      const file = fileInput.files[0];
+
+      if (!file) {
+        setStatus("Choose a GeoTIFF first.", true);
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("category", categorySelect.value);
+
+      convertButton.disabled = true;
+      const startedAt = performance.now();
+      const timer = window.setInterval(() => {
+        const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+        setStatus(`Uploading and converting... ${elapsedSeconds}s`);
+      }, 250);
+      setStatus("Uploading and converting... 0.0s");
+
+      try {
+        const uploadResponse = await fetch("/upload-and-convert", {
+          method: "POST",
+          body: formData,
+        });
+
+        const uploadResult = await uploadResponse.json();
+
+        if (!uploadResponse.ok) {
+          throw new Error(uploadResult.detail || "Upload failed.");
+        }
+
+        await loadCogList(uploadResult.filename);
+        await viewCog(uploadResult.filename);
+        const timingText = uploadResult.reused
+          ? `Existing valid COG used · Upload check: ${uploadResult.upload_seconds}s · Total: ${uploadResult.total_seconds}s`
+          : `Converted new COG · Upload: ${uploadResult.upload_seconds}s · COG: ${uploadResult.conversion_seconds}s · Total: ${uploadResult.total_seconds}s`;
+        const rescaleText = uploadResult.rescale ? ` · Rescale: ${uploadResult.rescale.min} to ${uploadResult.rescale.max}` : "";
+        setStatus(`${timingText}${rescaleText}`);
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || "Something went wrong.", true);
+      } finally {
+        window.clearInterval(timer);
+        convertButton.disabled = false;
+      }
+    });
+
+    bulkButton.addEventListener("click", async () => {
+      const files = Array.from(folderInput.files || []).filter((file) => /\.(tif|tiff)$/i.test(file.name));
+
+      if (!files.length) {
+        setStatus("Choose a folder containing TIFF files.", true);
+        return;
+      }
+
+      const formData = new FormData();
+      for (const file of files) {
+        formData.append("files", file, file.webkitRelativePath || file.name);
+      }
+
+      bulkButton.disabled = true;
+      convertButton.disabled = true;
+      const startedAt = performance.now();
+      const timer = window.setInterval(() => {
+        const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+        setStatus(`Processing folder... ${elapsedSeconds}s`);
+      }, 250);
+      setStatus("Processing folder... 0.0s");
+
+      try {
+        const response = await fetch("/bulk-upload-and-convert", {
+          method: "POST",
+          body: formData,
+        });
+        const result = await response.json();
+
+        if (!response.ok) {
+          throw new Error(result.detail || "Bulk processing failed.");
+        }
+
+        const firstViewable = (result.results || []).find((item) => item.filename && (item.status === "converted" || item.status === "reused"));
+        await loadCogList(firstViewable ? firstViewable.filename : cogSelect.value);
+
+        if (firstViewable) {
+          await viewCog(firstViewable.filename);
+        }
+
+        const summary = result.summary || {};
+        setStatus(`Bulk complete · Converted: ${summary.converted || 0} · Reused: ${summary.reused || 0} · Skipped: ${summary.skipped || 0} · Failed: ${summary.failed || 0}`);
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || "Bulk processing failed.", true);
+      } finally {
+        window.clearInterval(timer);
+        bulkButton.disabled = false;
+        convertButton.disabled = false;
+      }
+    });
+
+    viewCogButton.addEventListener("click", async () => {
+      viewCogButton.disabled = true;
+
+      try {
+        await viewCog(cogSelect.value);
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || "Could not view selected COG.", true);
+      } finally {
+        viewCogButton.disabled = false;
+      }
+    });
+
+    refreshCogsButton.addEventListener("click", async () => {
+      refreshCogsButton.disabled = true;
+
+      try {
+        await loadCogList(cogSelect.value);
+        setStatus("COG list refreshed.");
+      } catch (error) {
+        console.error(error);
+        setStatus(error.message || "Could not refresh COG list.", true);
+      } finally {
+        refreshCogsButton.disabled = false;
+      }
+    });
+
+    loadCogList();
+  </script>
+</body>
+</html>

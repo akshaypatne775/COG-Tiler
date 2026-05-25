@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+titiler.core
+rio-cogeo
+rasterio
+jinja2
+python-multipart
+aiofiles
+numpy
+pillow
