@@ -27,11 +27,13 @@ from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 from starlette.concurrency import run_in_threadpool
 from titiler.core.factory import TilerFactory
+from terrain_3d import Terrain3DOptions, generate_terrain_3d
 
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 COG_DIR = BASE_DIR / "cogs"
+TERRAIN3D_DIR = BASE_DIR / "terrain3d"
 logger = logging.getLogger("cog-tiler-poc")
 TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
@@ -40,13 +42,13 @@ CATEGORIES = {"ortho", "dtm", "dsm"}
 AGISOFT_DEM_CMAP = None
 
 
-def build_agisoft_dem_colormap() -> dict[int, tuple[int, int, int, int]]:
+def build_dji_terra_colormap() -> dict[int, tuple[int, int, int, int]]:
     stops = [
-        (0.00, (30, 50, 200)),
-        (0.25, (0, 225, 225)),
-        (0.50, (0, 210, 0)),
-        (0.75, (230, 230, 0)),
-        (1.00, (230, 30, 30)),
+        (0.00, (0, 0, 130)),
+        (0.25, (0, 255, 255)),
+        (0.50, (0, 255, 0)),
+        (0.75, (255, 255, 0)),
+        (1.00, (139, 0, 0)),
     ]
     color_map: dict[int, tuple[int, int, int, int]] = {}
 
@@ -69,15 +71,17 @@ def build_agisoft_dem_colormap() -> dict[int, tuple[int, int, int, int]]:
     return color_map
 
 
-AGISOFT_DEM_CMAP = build_agisoft_dem_colormap()
+AGISOFT_DEM_CMAP = build_dji_terra_colormap()
 cmap.register({"agisoft_dem": AGISOFT_DEM_CMAP})
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 COG_DIR.mkdir(exist_ok=True)
+TERRAIN3D_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="COG Tiler PoC")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.mount("/terrain3d", StaticFiles(directory=str(TERRAIN3D_DIR)), name="terrain3d")
 
 
 def raster_path(url: str = Query(..., description="Local COG path or URI")) -> str:
@@ -164,6 +168,45 @@ def infer_category_from_relative_path(relative_path: str) -> str | None:
 
 def write_cog_metadata(cog_path: Path, metadata: dict) -> None:
     metadata_path(cog_path).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def safe_slug(value: str) -> str:
+    slug = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+    return slug.strip("_") or "terrain"
+
+
+def terrain3d_slug(filename: str) -> str:
+    return safe_slug(Path(filename).stem)
+
+
+def terrain3d_output_dir(filename: str) -> Path:
+    return TERRAIN3D_DIR / terrain3d_slug(filename)
+
+
+def terrain3d_info(filename: str) -> dict | None:
+    slug = terrain3d_slug(filename)
+    output_dir = TERRAIN3D_DIR / slug
+    tileset_path = output_dir / "tileset.json"
+    viewer_path = output_dir / "viewer_3d.html"
+    metadata_path_3d = output_dir / "terrain3d.json"
+
+    if not tileset_path.exists() or not viewer_path.exists():
+        return None
+
+    metadata = {}
+
+    if metadata_path_3d.exists():
+        try:
+            metadata = json.loads(metadata_path_3d.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    return {
+        "slug": slug,
+        "viewer_url": f"/terrain3d/{slug}/viewer_3d.html",
+        "tileset_url": f"/terrain3d/{slug}/tileset.json",
+        "metadata": metadata,
+    }
 
 
 def build_cog_destination_profile(category: str) -> dict:
@@ -259,6 +302,7 @@ def cog_info(cog_path: Path) -> dict:
         "modified": stat.st_mtime,
         "category": category if category in CATEGORIES else "ortho",
         "rescale": rescale,
+        "terrain3d": terrain3d_info(cog_path.name),
         "message": metadata.get("message"),
         "valid": is_valid,
         "error": error,
@@ -653,6 +697,75 @@ async def export_grid(
     )
 
 
+@app.post("/generate-3d")
+async def generate_3d(
+    filename: str = Form(...),
+    mesh_step: int = Form(4),
+    mesh_grid: int = Form(1),
+    vertical_exag: float = Form(1.0),
+    force: bool = Form(False),
+):
+    cog_path = get_cog_path_or_404(filename)
+    metadata = read_cog_metadata(cog_path)
+    category = metadata.get("category") or infer_category_from_name(cog_path.name)
+
+    if category not in {"dtm", "dsm"}:
+        raise HTTPException(status_code=400, detail="3D terrain generation is available only for DTM or DSM COGs.")
+
+    mesh_step = max(1, min(int(mesh_step), 64))
+    mesh_grid = 1
+    vertical_exag = max(0.1, min(float(vertical_exag), 20.0))
+    output_dir = terrain3d_output_dir(cog_path.name)
+
+    if not force:
+        existing = terrain3d_info(cog_path.name)
+        if existing:
+            return {
+                "filename": cog_path.name,
+                "category": category,
+                "reused": True,
+                **existing,
+            }
+
+    started = perf_counter()
+
+    try:
+        await run_in_threadpool(
+            generate_terrain_3d,
+            cog_path,
+            output_dir,
+            options=Terrain3DOptions(
+                step=mesh_step,
+                tiles_x=mesh_grid,
+                tiles_y=mesh_grid,
+                vertical_exaggeration=vertical_exag,
+            ),
+            metadata={
+                "id": terrain3d_slug(cog_path.name),
+                "label": f"{category.upper()} 3D - {cog_path.stem}",
+                "category": category,
+                "source_cog": cog_path.name,
+            },
+        )
+    except Exception as exc:
+        logger.exception("3D terrain generation failed for %s", cog_path.name)
+        raise HTTPException(status_code=500, detail=f"3D terrain generation failed: {exc}") from exc
+
+    elapsed = perf_counter() - started
+    info = terrain3d_info(cog_path.name)
+
+    if not info:
+        raise HTTPException(status_code=500, detail="3D terrain finished but output files were not found.")
+
+    return {
+        "filename": cog_path.name,
+        "category": category,
+        "reused": False,
+        "seconds": round(elapsed, 2),
+        **info,
+    }
+
+
 def parse_rescale(value: str | None) -> tuple[float, float] | None:
     if not value:
         return None
@@ -670,16 +783,38 @@ def parse_rescale(value: str | None) -> tuple[float, float] | None:
 
 def render_dem_png(tile_array, rescale: tuple[float, float]) -> bytes:
     band = tile_array[0]
-    mask = np.ma.getmaskarray(band) | ~np.isfinite(np.asarray(band, dtype="float64"))
     values = np.ma.filled(band, np.nan).astype("float64")
+    mask = np.ma.getmaskarray(band) | ~np.isfinite(values)
     low, high = rescale
 
     normalized = np.clip((values - low) / (high - low), 0, 1)
     color_indexes = np.nan_to_num(normalized * 255, nan=0).astype("uint8")
 
     lookup = np.array([AGISOFT_DEM_CMAP[index] for index in range(256)], dtype="uint8")
-    rgba = lookup[color_indexes]
+    rgba = lookup[color_indexes].astype("float64")
+
+    valid_values = values[~mask]
+    fill_value = float(np.nanmean(valid_values)) if valid_values.size else 0.0
+    elevation = np.where(mask, fill_value, values)
+
+    z_factor = 3.0
+    dy, dx = np.gradient(elevation * z_factor)
+
+    slope = np.arctan(np.sqrt((dx * dx) + (dy * dy)))
+    aspect = np.arctan2(dy, -dx)
+
+    azimuth = np.deg2rad(315.0)
+    altitude = np.deg2rad(45.0)
+    hillshade = (
+        (np.sin(altitude) * np.cos(slope))
+        + (np.cos(altitude) * np.sin(slope) * np.cos(azimuth - aspect))
+    )
+    hillshade = np.clip(np.nan_to_num(hillshade, nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+
+    detail_shade = 0.32 + (0.68 * hillshade)
+    rgba[..., :3] = np.clip(rgba[..., :3] * detail_shade[..., np.newaxis], 0, 255)
     rgba[mask, 3] = 0
+    rgba = rgba.astype("uint8")
 
     image = Image.fromarray(rgba, mode="RGBA")
     output = io.BytesIO()

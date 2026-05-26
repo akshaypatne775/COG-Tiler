@@ -47,6 +47,7 @@ if errorlevel 1 (
 echo Creating data folders...
 if not exist uploads mkdir uploads
 if not exist cogs mkdir cogs
+if not exist terrain3d mkdir terrain3d
 if not exist templates mkdir templates
 if not exist static mkdir static
 

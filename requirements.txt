@@ -9,3 +9,7 @@ aiofiles
 numpy
 pillow
 ezdxf
+py3dtiles
+pygltflib
+pyproj
+tqdm
