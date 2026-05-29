@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local/runtime data
+uploads/*
+cogs/*
+terrain3d/*
+
+# Keep folder structure
+!uploads/.gitkeep
+!cogs/.gitkeep
+!terrain3d/.gitkeep
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large GIS/raw data
+*.tif
+*.tiff
+*.las
+*.laz
+*.b3dm
+*.glb
+*.gltf
+*.dxf
+*.csv
